@@ -1,0 +1,412 @@
+---
+title: "Fielder Dashboards"
+author: "Drew Duffy"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+ # devtools::install_github("bdilday/GeomMLBStadiums")
+library(GeomMLBStadiums)
+library(baseballr)
+library(ggplot2)
+library(dplyr)
+library(png)
+library(grid)
+library(patchwork)
+library(knitr)
+library(gridExtra)
+library(cowplot)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+This extended code block gives the basic path to find all of the information on the data that we are gathering on a weekly basis. 
+```{r data_gathering}
+batted_ball_data <- statcast_search(start_date = "2024-08-18", end_date = "2024-08-24")
+
+out_outcomes <- c("field_out", "force_out", "sac_bunt", "fielders_choice_out", "other_out", 
+                  "grounded_into_double_play", "sac_fly", "double_play", "sac_fly_double_play")
+
+out_prob_dash <-batted_ball_data %>% 
+  mutate(location = as.factor(hit_location), 
+         infield_align = as.factor(if_fielding_alignment), 
+         of_align = as.factor(of_fielding_alignment), 
+         description = as.factor(description),
+         out_hit = ifelse(events %in% out_outcomes, 1, 0)) %>%
+  select(launch_speed, launch_angle, home_team, away_team, inning_topbot, estimated_woba_using_speedangle,
+         location, bat_speed, swing_length, release_speed, description, delta_home_win_exp, delta_run_exp,hit_distance_sc, infield_align, of_align, hc_x, hc_y, events, out_hit, pitcher, fielder_2, fielder_3, fielder_4, fielder_5, fielder_6, fielder_7, fielder_8, fielder_9, game_date, bb_type) %>%   
+  filter(description == "hit_into_play")
+
+
+out_prob_dash <- out_prob_dash %>%
+  mutate(defteam = case_when(
+    inning_topbot == "Top" ~ home_team, 
+    inning_topbot == "Bot" ~ away_team 
+  ))
+fielder_mapping <- function(location) {
+  case_when(
+    location == 1 ~ "fielder_1",
+    location == 2 ~ "fielder_2",
+    location == 3 ~ "fielder_3",
+    location == 4 ~ "fielder_4",
+    location == 5 ~ "fielder_5",
+    location == 6 ~ "fielder_6",
+    location == 7 ~ "fielder_7",
+    location == 8 ~ "fielder_8",
+    location == 9 ~ "fielder_9",
+    TRUE ~ "unknown_fielder"
+  )
+}
+
+out_prob_dash <- out_prob_dash %>%
+  mutate(fielder = sapply(location, fielder_mapping))
+
+
+out_prob_dash <- out_prob_dash %>%
+  mutate(key_mlbam = case_when(
+    location == 1 ~ pitcher,
+    location == 2 ~ fielder_2,
+    location == 3 ~ fielder_3,
+    location == 4 ~ fielder_4,
+    location == 5 ~ fielder_5,
+    location == 6 ~ fielder_6,
+    location == 7 ~ fielder_7,
+    location == 8 ~ fielder_8,
+    location == 9 ~ fielder_9,
+    TRUE ~ NA
+  )) %>%
+  mutate(key_mlbam = as.factor(key_mlbam))
+
+# creating a vector for the player registry
+player_name <- chadwick_player_lu()
+
+# selecting relevant columns in this data
+player_name <- player_name %>%
+  select(key_mlbam, name_last, name_first, birth_year) %>% 
+  mutate(key_mlbam = as.factor(key_mlbam)) %>% 
+  filter(!is.na(key_mlbam), 
+    !is.na(birth_year))
+
+# joining the data on the key_mlbam and including player names 
+list_with_names <- right_join(out_prob_dash, player_name, "key_mlbam") %>%
+  na.omit()
+
+
+
+final_out_prob <- list_with_names %>% 
+  select(launch_speed, launch_angle, estimated_woba_using_speedangle,
+         location, release_speed, hc_x, hc_y, description, delta_home_win_exp, delta_run_exp,
+         hit_distance_sc, infield_align, of_align, events, out_hit, pitcher, game_date, 
+         key_mlbam, name_last, name_first, out_hit, bb_type, defteam)
+
+# comnbining first and last name
+final_out_prob$name_full <- paste(list_with_names$name_first, list_with_names$name_last)
+
+# this is the model we will use to get our predicted out probabilities
+out_model <- glm(out_hit ~ launch_speed + launch_angle + estimated_woba_using_speedangle +
+                   location  + 
+                   hit_distance_sc + infield_align + hc_x + hc_y + bb_type, 
+                 data = final_out_prob,
+                 family = binomial())
+summary(out_model)
+
+final_out_prob$predicted_prob <- predict(out_model, newdata = final_out_prob, type = "response")
+
+# we need to create a vector for l  teams abbreviations and match them to the full team name
+team_name_full <- data.frame(
+  defteam = c("AZ", "ATL", "BAL", "BOS", "CHC", "CWS", "CIN", "CLE", "COL", "DET",
+              "HOU", "KC", "LAA", "LAD", "MIA", "MIL", "MIN", "NYM", "NYY", "OAK",
+              "PHI", "PIT", "SD", "SFG", "SEA", "STL", "TBR", "TEX", "TOR", "WSN"),
+  team = c("diamondbacks", "braves", "orioles", "red sox", "cubs", "white sox", "reds",
+           "guardians", "rockies", "tigers", "astros", "royals", "angels", "dodgers",
+           "marlins", "brewers", "twins", "mets", "yankees", "athletics", "phillies",
+           "pirates", "padres", "giants", "mariners", "cardinals", "rays", "rangers",
+           "blue jays", "nationals")
+)
+# joining in the full team names to use on spraychart
+final_out_prob <- final_out_prob %>%
+  left_join(team_name_full, by = "defteam")
+
+
+# narrowing down our score and grouping by player name
+grouped_by_player <- final_out_prob %>% 
+  select(team, name_full, key_mlbam, events, estimated_woba_using_speedangle, delta_home_win_exp, delta_run_exp,location, hc_x, hc_y, predicted_prob, out_hit, game_date) %>% 
+  group_by(name_full)
+
+# This will turn the x and y coordinates to be representative of proper distance from home plate
+
+grouped_by_player <- mlbam_xy_transformation(grouped_by_player)
+
+
+players_to_use <- c("571970")  #!! Replace with your specific player IDs !!
+
+# Filter the data for the specified players
+filtered_data <- grouped_by_player %>%
+  filter(key_mlbam %in% players_to_use) %>% 
+  mutate(out_hit = as.factor(out_hit))
+
+filter <- final_out_prob %>% 
+  filter(key_mlbam %in% players_to_use) %>% 
+  mutate(out_hit = as.factor(out_hit))
+
+has_field_errors <- filter %>%
+  filter(events == "field_error") %>%
+  nrow() > 0
+
+# Create the table_grob and add title if there are field errors
+error_add_grob <- if (has_field_errors) {
+  table_data <- filter %>%
+    filter(events == "field_error") %>%
+    rename(weighted_error = delta_home_win_exp, 
+           delta_runexp = delta_run_exp) %>% 
+    select(weighted_error, delta_runexp)
+}
+# Create the error table if there are field errors
+error_add_grob <- if (has_field_errors) {
+  tableGrob(
+    filter %>%
+      filter(events == "field_error") %>%
+      rename(weighted_error = delta_home_win_exp, 
+             delta_runexp = delta_run_exp) %>% 
+      select(weighted_error, delta_runexp) 
+  )
+} else {
+  NULL
+}
+```
+This is the code chunk for the table in our dashboard, where we will look at the readily available Baseball Savant leaderboard information. This will allow us to make a table to put at the bottom of our dashboard. 
+```{r savant fielder info}
+
+# we are going to scrape savant for directional and overall outs above average
+savant <- baseballr::scrape_savant_leaderboards(leaderboard = "outs_above_average", min_field = 100, year = 2024)
+savant_dir_out <- baseballr::scrape_savant_leaderboards(leaderboard = "directional_oaa", min_field = 5, year = 2024)
+
+# we join these so that each player_id has all information
+total_savant <- right_join(savant, savant_dir_out, by = "player_id")
+
+
+# ((OUTFIELDERS)) doing some clean up for what we want to look at and what our columns should be called 
+total_savant_of <- total_savant %>% 
+  select(player_id, `last_name, first_name.x`, primary_pos_formatted, outs_above_average, attempts, fielding_runs_prevented, 
+         n_oaa_slice_back_all, display_team_name,
+         n_oaa_slice_in_all) %>% 
+  rename(name = `last_name, first_name.x`,
+         Team = display_team_name,
+         position = primary_pos_formatted,
+         OAA = outs_above_average, 
+         Attempts = attempts, 
+         FRP = fielding_runs_prevented, 
+         OAA_Back = n_oaa_slice_back_all,
+         OAA_In = n_oaa_slice_in_all)
+
+player_stats <- total_savant_of %>%
+  filter(player_id == 641658) %>% # !! adjust with the proper player_id !!
+  select(Team, position, OAA, Attempts, FRP, OAA_Back, OAA_In)
+
+table_grob <- tableGrob(player_stats)
+
+average_by_position <- total_savant_of %>%  
+  group_by(position) %>%
+  filter(position == "CF") %>% # filter on the position of the player to show comparison
+  summarise(
+    Avg_OAA = mean(OAA, na.rm = TRUE),
+    Avg_Attempts = mean(Attempts, na.rm = TRUE),
+    Avg_FRP = mean(FRP, na.rm = TRUE),
+    Avg_OAA_Back = mean(OAA_Back, na.rm = TRUE),
+    Avg_OAA_In = mean(OAA_In, na.rm = TRUE))
+    
+average_by_position_rounded_of <- average_by_position %>%
+  mutate(across(c(Avg_OAA, Avg_Attempts, Avg_FRP, Avg_OAA_Back, Avg_OAA_In), ~ round(.x, 2)))
+
+# Create a table grob with the rounded values
+table_grob_avg_of <- tableGrob(average_by_position_rounded_of)
+grid.draw(table_grob_avg_of)
+
+
+
+
+# ((INFIELDERS)) doing some clean up for what we want to look at and what our columns should be called 
+total_savant_infield <- savant %>% 
+  select(player_id, `last_name, first_name`, primary_pos_formatted, outs_above_average, fielding_runs_prevented, outs_above_average_lateral_toward3bline, outs_above_average_lateral_toward1bline, display_team_name) %>% 
+  rename(name = `last_name, first_name`,
+         Team = display_team_name,
+         position = primary_pos_formatted,
+         OAA = outs_above_average, 
+         FRP = fielding_runs_prevented, 
+         OAA_to_1st = outs_above_average_lateral_toward1bline,
+         OAA_to_3rd = outs_above_average_lateral_toward3bline)
+  
+player_stats <- total_savant_infield %>%
+  filter(player_id == 571970) %>% # !! adjust with the proper player_id !!
+  select(Team, position, OAA, FRP, OAA_to_1st, OAA_to_3rd)
+
+
+# Display the table
+table_grob <- tableGrob(player_stats)
+
+# creating a way to see difference between the player and league averages for same criteria
+average_by_position <- total_savant_infield %>%  
+  group_by(position) %>%
+  filter(position == "3B") %>% # filter on the position of the player to show comparison
+  summarise(
+    Avg_OAA = mean(OAA, na.rm = TRUE),
+    Avg_FRP = mean(FRP, na.rm = TRUE),
+    Avg_OAA_to_1st = mean(OAA_to_1st, na.rm = TRUE),
+    Avg_OAA_to_3rd = mean(OAA_to_3rd, na.rm = TRUE))
+    
+average_by_position_rounded_if <- average_by_position %>%
+  mutate(across(c(Avg_OAA, Avg_FRP, Avg_OAA_to_1st, Avg_OAA_to_3rd), ~ round(.x, 2)))
+
+# Create a table grob with the rounded values
+table_grob_avg_if <- tableGrob(average_by_position_rounded_if)
+grid.draw(table_grob_avg_if)
+
+
+```
+
+This code chunk uses MLB.com to find the headshots for each player that we want to look at. Insert the player_id into the key_mlbam at the bottom to save the headshot as a distinct plot. 
+```{r Headshot}
+
+# get the MLB headshot for each player I am looking at, copy and paste the key_mlbam in the bottom of the code
+
+player_headshot_plot <- function(key_mlbam) {
+  # Define a grob for the image
+  headshot_grob <- function() {
+    url <- paste0('https://img.mlbstatic.com/mlb-photos/image/',
+                  'upload/d_people:generic:headshot:67:current.png/',
+                  'w_640,q_auto:best/v1/people/', key_mlbam,
+                  '/headshot/silo/current.png')
+    temp_file <- tempfile(fileext = ".png")
+    download.file(url, temp_file, mode = "wb")
+    img <- readPNG(temp_file)
+    rasterGrob(img, width = unit(1, "npc"), height = unit(1, "npc"))
+  }
+    ggplot() +
+    annotation_custom(headshot_grob(), xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+    theme_void()
+}
+
+# Create the standalone headshot plot by inserting the player_id into the key_mlbam
+headshot_plot <- player_headshot_plot(key_mlbam = "571970") ## !!!!
+
+headshot_plot_resized <- ggdraw() +
+  draw_plot(headshot_plot, x = .05, y = -1.25, width = .21, height = 2) 
+```
+This will allow us to create a de facto text box for the best play of the week that we can highlight to the audience
+```{r Text for Best Play of the Week and Name}
+
+# Load necessary libraries
+library(ggplot2)
+library(cowplot)  # For ggdraw() and plot_grid()
+
+game_date_plot <- "                August 24th         "
+predicted_prob_plot <- "                    72.6%      "
+
+  dashboard_text <- ggplot() +
+    geom_text(
+      aes(
+        x = -0.50, 
+        y = 0.5, 
+        label = paste(
+          "Best play of the Week came on\n", 
+                  game_date_plot,
+          "\nwhere the out probability was\n", 
+               predicted_prob_plot
+        )
+      ),
+      size = 5, 
+      hjust = 0, 
+      vjust = 0.5, 
+      fontface = "bold"
+    ) +
+    theme_void() + 
+    theme(plot.margin = margin(.5, .5, .5, .5, "cm"))
+
+# creating a name plot for the final dashboard
+name_plot <- ggplot() +
+  geom_text(
+    aes(x = 0.15, y = 0.5, label = "Max Muncy"), ## !!
+    size = 13,   # Adjust size as needed
+    hjust = 0.5, 
+    vjust = 0.5, 
+    fontface = "bold"
+  ) +
+  theme_void()
+
+```
+This will combine all the plots for a more finished product and will let you customize the appearance of each. 
+```{r Combining the Plots}
+# this is the code for the player spray chart for the selected player
+player_spray_gg <- ggplot(filtered_data, aes(x = hc_x_, y = hc_y_, color = predicted_prob, shape = out_hit)) + 
+  geom_spraychart(stadium_ids = unique(filtered_data$team), 
+                  stadium_transform_coords = TRUE, 
+                  stadium_segments = "all", size = 5,
+                  stadium_aes = TRUE) +
+  geom_point(size = 3, alpha = 0.6) +
+#  stat_density2d(color='gray') +
+    scale_shape_manual(
+    values = c(17, 16),          # Manually specify the shape values
+    labels = c("Out", "Hit"),  # Labels for the legend
+    breaks = c(1, 0)           # Order in the legend
+  ) +
+  scale_color_gradient(low = "lightpink", high = "darkblue", name = "Predicted Probability") +
+  labs(
+    title = "                Defensive Spray Chart \n with Predicted Out Probability and Outcomes",
+    subtitle = "                          Week of August 18 - August 25"
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 14, color = "blue", margin = margin(t = 10))
+  ) +
+  theme_void() +
+  coord_fixed() +
+  facet_wrap(~team) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 18, face = "bold"),
+        strip.text = element_text(size = 12, face = "bold")) 
+  
+  
+
+full_plot <- ggplot() +
+  theme_void() +
+  coord_fixed(ratio = 1)  # Adjust ratio if needed to fit your plots
+
+# Use draw_plot to place individual plots
+finished_dash <- ggdraw(full_plot) +
+  draw_plot(headshot_plot_resized, x = .01, y = 0.6, width = 1, height = 0.2) + 
+  draw_plot(dashboard_text, x = -.18, y = -0.0, width = 0.5, height = 0.5) + 
+  draw_plot(player_spray_gg, x = 0.2, y = 0.2, width = .75, height = .75) +  
+  draw_plot(table_grob, x = 0.3, y = -.1, width = 0.5, height = 0.5) +  
+  draw_plot(table_grob_avg_if, x = 0.3, y = -.2, width = 0.5, height = 0.5) +  #have to change this depending on infielder or outfielder
+  draw_plot(name_plot, x = -.080, y = 0.55, width = 0.5, height = 0.5)  
+
+# Conditionally add `error_add_grob` if it is not NULL
+if (!is.null(error_add_grob)) {
+  finished_dash <- finished_dash +
+    draw_plot(as_grob(error_add_grob), x = 0.6, y = .4, width = 0.5, height = 0.3)
+}
+
+```
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(finished_dash)
+```
+
+
+
+
+```{r Save Plot}
+ggsave(filename = "muncy_max_finished_dash.jpg", plot = finished_dash, width = 10, height = 6, units = "in", dpi = 300)
+
+
+```
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
